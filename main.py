@@ -10,8 +10,9 @@ async def main():
     parser = argparse.ArgumentParser(description="Telegram Saved Messages Backup Tool")
     parser.add_argument("--api-id", type=int, help="Telegram API ID")
     parser.add_argument("--api-hash", type=str, help="Telegram API Hash")
+    parser.add_argument("--phone", type=str, help="Phone number with country code")
     parser.add_argument(
-        "--session", type=str, default="mysession", help="Session file name"
+        "--session", type=str, default="saved_forever", help="Session file name"
     )
     parser.add_argument(
         "--path", type=str, default="./downloads", help="Download directory"
@@ -21,6 +22,11 @@ async def main():
         type=int,
         default=None,
         help="Number of messages to check (default: all)",
+    )
+    parser.add_argument(
+        "--reset-state",
+        action="store_true",
+        help="Ignore state file and start from scratch",
     )
 
     args = parser.parse_args()
@@ -37,7 +43,7 @@ async def main():
     if not api_hash:
         api_hash = os.environ.get("TG_API_HASH")
 
-    # Fallback to interactive input
+    # Fallback to interactive input if not provided
     if not api_id:
         try:
             val = input("Enter Telegram API ID: ")
@@ -47,23 +53,32 @@ async def main():
             sys.exit(1)
 
     if not api_hash:
-        api_hash = input("Enter Telegram API Hash: ")
+        api_hash = input("Enter Telegram API Hash: ").strip()
         if not api_hash:
             print("Invalid API Hash. Exiting.")
             sys.exit(1)
 
+    phone = args.phone
+    if not phone and not os.path.exists(f"{args.session}.session"):
+        phone = input("Enter phone number (e.g., +123456789): ").strip()
+
     downloader = MTDownloader(
         session_name=args.session, api_id=api_id, api_hash=api_hash, base_path=args.path
     )
+    
+    if args.reset_state:
+        downloader.last_msg_id = 0
 
     try:
-        await downloader.start()
+        await downloader.start(phone=phone)
         print("Starting backup of Saved Messages...")
         await downloader.backup_saved_messages(limit=args.limit)
         print("Backup completed successfully.")
     except KeyboardInterrupt:
         print("\nBackup interrupted by user.")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"\nAn error occurred: {e}")
     finally:
         await downloader.close()

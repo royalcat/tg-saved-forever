@@ -1,70 +1,53 @@
 # Telegram Saved Messages Backup Tool
 
-A Python CLI tool to backup your Telegram "Saved Messages" chat. It downloads text messages, media (photos, videos, documents), and content from Telegraph links.
+This tool allows you to backup your Telegram "Saved Messages" chat to your local machine. It saves text, media, Telegraph pages, and follows links to other messages.
 
 ## Features
 
-- **Authentication**: Connects via Telegram API (requires API ID and Hash).
-- **Incremental Backup**: Checks for existing files to avoid re-downloading.
-- **Media Support**: Downloads Photos, Videos, Documents.
-- **Telegraph Support**: Parses and downloads content from `telegra.ph` links.
-- **Linked Messages**: Recursively parses and downloads messages linked (e.g., `t.me/c/...`) within your saved messages.
-- **Forwarded Messages**: Preserves forward metadata and downloads content.
-- **Progress Bars**: Visual feedback for message processing and file downloads.
-
-## Prerequisites
-
-- Python 3.8+
-- Telegram API Credentials: Get your `api_id` and `api_hash` from [https://my.telegram.org/apps](https://my.telegram.org/apps).
+- **Resume-ability**: Tracks the last downloaded message to avoid duplicate downloads.
+- **Media Download**: Downloads all media files with a progress bar.
+- **Telegraph Backup**: Downloads Telegraph pages and their images for offline viewing.
+- **Link Parsing**: Automatically fetches and downloads content from `t.me/...` links found in your messages.
+- **Organized Storage**: Each message is stored in its own folder with metadata and files.
 
 ## Installation
 
-1. Clone the repository.
-2. Install dependencies:
-   ```bash
-   pip install telethon aiohttp aiofiles beautifulsoup4 tqdm
-   ```
+1.  Clone the repository or download the files.
+2.  Install dependencies:
+    ```bash
+    pip install -r requirements.txt
+    ```
 
 ## Usage
 
-Run the tool using `main.py`. You can provide credentials via arguments, environment variables, or interactive input.
+1.  Get your **API ID** and **API Hash** from [my.telegram.org](https://my.telegram.org).
+2.  Run the script:
+    ```bash
+    python main.py --api-id YOUR_ID --api-hash YOUR_HASH --phone +YOUR_PHONE
+    ```
 
 ### Command Line Arguments
 
-```bash
-python main.py --api-id <YOUR_API_ID> --api-hash <YOUR_API_HASH> --path <DOWNLOAD_PATH>
-```
-
 - `--api-id`: Your Telegram API ID.
 - `--api-hash`: Your Telegram API Hash.
-- `--session`: Session file name (default: "mysession").
-- `--path`: Directory to save downloads (default: "./downloads").
-- `--limit`: Number of messages to process (default: all).
+- `--phone`: Your phone number in international format (e.g., +123456789).
+- `--path`: Directory where data will be saved (default: `./downloads`).
+- `--limit`: Max number of messages to process.
+- `--session`: Custom session name (default: `saved_forever`).
+- `--reset-state`: Start from the very first message regardless of previous progress.
 
-### Environment Variables
+## Storage Format
 
-You can set `TG_API_ID` and `TG_API_HASH` in your environment to avoid passing them as arguments.
-
-```bash
-export TG_API_ID=123456
-export TG_API_HASH=abcdef...
-python main.py
+Downloads are organized by message ID:
 ```
-
-### Interactive Mode
-
-If you run `python main.py` without arguments, it will prompt you for the API ID and Hash.
-
-## Output Structure
-
-Files are saved in the specified download directory with the following naming convention:
-- `{message_id}_meta.json`: JSON file containing message text and metadata.
-- `{message_id}_media.ext`: Downloaded media file.
-- `{message_id}_telegraph.html`: Telegraph page content.
-- `{message_id}_telegraph_img_X.ext`: Telegraph page images.
-- `linked_{original_id}_...`: Content from linked messages.
-
-## Notes
-
-- The first time you run it, you will be asked to enter your phone number and the code sent to your Telegram account to authenticate.
-- The session is saved locally (e.g., `mysession.session`), so subsequent runs won't require re-login.
+downloads/
+  .state.json           # Tracks progress
+  101/
+    meta.json           # JSON metadata (date, chat_id, text, etc.)
+    message.txt         # Plain text message
+    photo.jpg           # Downloaded media
+    telegraph_0/        # Local copy of a Telegraph link
+      index.html
+      images/
+        ...
+```
