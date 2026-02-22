@@ -4,6 +4,7 @@
 - **Authentication**: Uses Telethon (user agent) to authenticate.
 - **Incremental Backup**: Tracks `last_msg_id` in `.state.json` to resume from the last message.
 - **Storage**: Data is saved in `./downloads/` as plain files (JSON, TXT, and media) organized by message ID.
+- **HTML Backup**: Automatically generates a chat-like HTML interface (`index.html` in the downloads folder) to browse messages and media offline.
 - **Rich Media**: Supports downloading standard media, Telegraph pages (with images), and following `t.me` message links.
 
 ## Tech Stack

@@ -28,8 +28,18 @@ async def main():
         action="store_true",
         help="Ignore state file and start from scratch",
     )
+    parser.add_argument(
+        "--html-only",
+        action="store_true",
+        help="Only generate HTML from existing downloads",
+    )
 
     args = parser.parse_args()
+
+    if args.html_only:
+        from html_generator import generate_html
+        generate_html(args.path)
+        return
 
     api_id = args.api_id
     api_hash = args.api_hash
@@ -74,6 +84,9 @@ async def main():
         print("Starting backup of Saved Messages...")
         await downloader.backup_saved_messages(limit=args.limit)
         print("Backup completed successfully.")
+        
+        from html_generator import generate_html
+        generate_html(args.path)
     except KeyboardInterrupt:
         print("\nBackup interrupted by user.")
     except Exception as e:

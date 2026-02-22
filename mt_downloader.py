@@ -94,9 +94,13 @@ class MTDownloader:
             print("No new messages to backup.")
             return
 
-        pbar = tqdm(total=len(messages), desc="Backing up messages", unit="msg")
+        pbar = tqdm(total=len(messages), desc="Backing up", unit="msg")
         for message in messages:
             try:
+                # Update progress bar description with dynamic message info
+                msg_date = message.date.strftime("%Y-%m-%d") if message.date else "Unknown"
+                pbar.set_description(f"Msg {message.id} ({msg_date})")
+                
                 await self._process_message(message)
                 if message.id > self.last_msg_id:
                     self.last_msg_id = message.id
@@ -105,6 +109,29 @@ class MTDownloader:
                 print(f"Error processing message {message.id}: {e}")
             pbar.update(1)
         pbar.close()
+
+    def _normalize_url(self, url: str) -> str:
+        if not url:
+            return ""
+        # 1. Fix protocol (handle common parsing errors like tps://)
+        if url.startswith("tps://"):
+            url = "https://" + url[6:]
+        elif url.startswith("http://"):
+            url = "https://" + url[7:]
+        elif not url.startswith("http"):
+            url = "https://" + url
+
+        # 2. Standardize case for hostname and strip trailing slash
+        # (Telegra.ph URLs are usually case-insensitive, but we stay safe)
+        url = url.rstrip("/")
+        
+        # 3. Strip redundant tracking parameters if any (basic check)
+        if "?" in url:
+            base, query = url.split("?", 1)
+            # You could filter query params here if needed
+            url = base
+
+        return url
 
     async def _process_message(self, message: Message, depth: int = 0):
         if depth > 2:  # Prevent deep recursion
@@ -135,14 +162,15 @@ class MTDownloader:
                     url = message.text[entity.offset : entity.offset + entity.length]
 
                 if url and "telegra.ph" in url:
-                    telegraph_urls.add(url)
+                    telegraph_urls.add(self._normalize_url(url))
 
         # Also check message.media.webpage
         if isinstance(message.media, MessageMediaWebPage) and isinstance(
             message.media.webpage, WebPage
         ):
-            if message.media.webpage.url and "telegra.ph" in message.media.webpage.url:
-                telegraph_urls.add(message.media.webpage.url)
+            wp_url = message.media.webpage.url
+            if wp_url and "telegra.ph" in wp_url:
+                telegraph_urls.add(self._normalize_url(wp_url))
 
         for i, url in enumerate(telegraph_urls):
             await self._download_telegraph(
@@ -248,38 +276,84 @@ class MTDownloader:
         return None
 
     async def _save_media(self, message: Message, folder: str):
-        # Find if media already exists (basic check)
-        # Telethon downloads with original filename if possible
+        # 1. Skip if we already have a valid non-zero file in this folder
+        # (excluding meta.json, message.txt, and directories like telegraph_*)
+        for f in os.listdir(folder):
+            full_path = os.path.join(folder, f)
+            if f in ["meta.json", "message.txt"] or f.startswith(".") or os.path.isdir(full_path):
+                continue
+            if os.path.getsize(full_path) > 0:
+                return
 
         try:
-            # We don't know the filename before download easily without more complex logic
-            # Let's just download. client.download_media will handle path.
+            # We want to download the main media or the webpage preview content
+            media = message.media
+            if not media:
+                return
+
+            # For WebPage media, download its document or photo
+            if isinstance(media, MessageMediaWebPage) and media.webpage:
+                if isinstance(media.webpage, WebPage):
+                    media = media.webpage.document or media.webpage.photo
+                else:
+                    return # e.g. WebPageEmpty
+            
+            if not media:
+                return
 
             with tqdm(
-                total=0, unit="B", unit_scale=True, desc="Media", leave=False
+                total=0, unit="B", unit_scale=True, desc=f"Media {message.id}", leave=False
             ) as pbar:
 
                 def callback(current, total):
-                    pbar.total = total
+                    if total:
+                        pbar.total = total
                     pbar.n = current
                     pbar.refresh()
 
                 # download_media returns the path where it was saved
-                await self.client.download_media(
-                    message, file=folder, progress_callback=callback
+                path = await self.client.download_media(
+                    media, file=folder, progress_callback=callback
                 )
+                
+                if path and os.path.exists(path):
+                    if os.path.getsize(path) == 0:
+                        os.remove(path)
+                        # We don't print here to avoid too much noise, but the file is cleaned up
         except Exception as e:
             print(f"Failed to download media for msg {message.id}: {e}")
 
     async def _download_telegraph(self, folder: str, url: str):
+        # 0. Skip if already exists
+        if os.path.exists(os.path.join(folder, "index.html")):
+            if os.path.getsize(os.path.join(folder, "index.html")) > 0:
+                return
+
         os.makedirs(folder, exist_ok=True)
         try:
-            async with self.session.get(url) as page:
-                if page.status != 200:
+            async with self.session.get(url) as response:
+                if response.status != 200:
+                    print(f"Failed to fetch telegraph {url}: HTTP {response.status}")
                     return
-                html = await page.text()
+                
+                content_type = response.headers.get("Content-Type", "").lower()
+                
+                # Handle direct image/file links (e.g., telegra.ph/file/...)
+                if "text/html" not in content_type:
+                    ext = os.path.splitext(url.split("?")[0])[1]
+                    if not ext:
+                        # Guess extension from content type
+                        if "image/" in content_type:
+                            ext = "." + content_type.split("/")[1]
+                    
+                    filename = f"direct_file{ext}"
+                    async with aiofiles.open(os.path.join(folder, filename), "wb") as f:
+                        await f.write(await response.read())
+                    return
+
+                html = await response.text()
         except Exception as e:
-            print(f"Failed to fetch telegraph {url}: {e}")
+            print(f"Failed to fetch telegraph {url}: {type(e).__name__}: {e}")
             return
 
         # Save HTML
@@ -295,20 +369,40 @@ class MTDownloader:
             img_folder = os.path.join(folder, "images")
             os.makedirs(img_folder, exist_ok=True)
 
+            pbar = tqdm(total=len(images), desc="Telegraph Images", unit="img", leave=False)
             for i, img in enumerate(images):
                 src = img.get("src")
                 if not src:
+                    pbar.update(1)
                     continue
+                
+                # Normalize image URL
                 if src.startswith("/"):
                     src = "https://telegra.ph" + src
+                elif src.startswith("tps://"):
+                    src = "ht" + src
+                elif not src.startswith("http"):
+                    src = "https://" + src
 
-                img_name = f"{i}_{os.path.basename(src)}"
+                img_name = f"{i}_{os.path.basename(src.split('?')[0])}"
                 img_path = os.path.join(img_folder, img_name)
+                
+                # Skip if image already exists and is not empty
+                if os.path.exists(img_path) and os.path.getsize(img_path) > 0:
+                    pbar.update(1)
+                    continue
 
                 try:
                     async with self.session.get(src) as r:
                         if r.status == 200:
-                            async with aiofiles.open(img_path, "wb") as f:
-                                await f.write(await r.read())
-                except Exception:
-                    pass
+                            content = await r.read()
+                            if content:
+                                async with aiofiles.open(img_path, "wb") as f:
+                                    await f.write(content)
+                        else:
+                            print(f"\n  Failed to download telegraph image {src}: HTTP {r.status}")
+                except Exception as e:
+                    print(f"\n  Error downloading telegraph image {src}: {e}")
+                
+                pbar.update(1)
+            pbar.close()
