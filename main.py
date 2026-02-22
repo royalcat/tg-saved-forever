@@ -33,6 +33,11 @@ async def main():
         action="store_true",
         help="Only generate HTML from existing downloads",
     )
+    parser.add_argument(
+        "--telegraph-download-js",
+        action="store_true",
+        help="DANGER: Download JavaScript for Telegraph pages. This is HIGHLY LIKELY to break local page layout and functionality. Use only for debugging.",
+    )
 
     args = parser.parse_args()
 
@@ -73,7 +78,11 @@ async def main():
         phone = input("Enter phone number (e.g., +123456789): ").strip()
 
     downloader = MTDownloader(
-        session_name=args.session, api_id=api_id, api_hash=api_hash, base_path=args.path
+        session_name=args.session,
+        api_id=api_id,
+        api_hash=api_hash,
+        base_path=args.path,
+        download_js=args.telegraph_download_js,
     )
     
     if args.reset_state:

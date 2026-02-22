@@ -36,6 +36,7 @@ class MTDownloader:
         api_id: int,
         api_hash: str,
         base_path: str = "./downloads",
+        download_js: bool = False,
     ):
         self.client = TelegramClient(
             session_name,
@@ -49,6 +50,7 @@ class MTDownloader:
         )
         self.session = None  # Initialized in start()
         self.base_path = base_path
+        self.download_js = download_js
         self.state_file = os.path.join(self.base_path, ".state.json")
         os.makedirs(self.base_path, exist_ok=True)
         self.last_msg_id = self._load_state()
@@ -342,7 +344,6 @@ class MTDownloader:
                 if "text/html" not in content_type:
                     ext = os.path.splitext(url.split("?")[0])[1]
                     if not ext:
-                        # Guess extension from content type
                         if "image/" in content_type:
                             ext = "." + content_type.split("/")[1]
                     
@@ -356,53 +357,106 @@ class MTDownloader:
             print(f"Failed to fetch telegraph {url}: {type(e).__name__}: {e}")
             return
 
-        # Save HTML
-        async with aiofiles.open(
-            os.path.join(folder, "index.html"), "w", encoding="utf-8"
-        ) as f:
-            await f.write(html)
-
         soup = bs(html, "html.parser")
-        images = soup.findAll("img")
 
-        if images:
-            img_folder = os.path.join(folder, "images")
-            os.makedirs(img_folder, exist_ok=True)
+        # 1. If JS is disabled, remove all script tags and don't download them
+        if not self.download_js:
+            for script in soup.find_all("script"):
+                script.decompose()
 
-            pbar = tqdm(total=len(images), desc="Telegraph Images", unit="img", leave=False)
-            for i, img in enumerate(images):
-                src = img.get("src")
-                if not src:
-                    pbar.update(1)
+        # 2. Collect all assets to download (tag, attribute, local_dir)
+        asset_targets = [
+            ("img", "src", "images"),
+            ("video", "src", "images"),
+            ("video", "poster", "images"),
+            ("audio", "src", "images"),
+            ("source", "src", "images"),
+            ("link", "href", "css"),
+        ]
+        if self.download_js:
+            asset_targets.append(("script", "src", "js"))
+        
+        asset_tasks = []
+        for tag, attr, local_dir in asset_targets:
+            for el in soup.find_all(tag):
+                val = el.get(attr)
+                if not val:
                     continue
                 
-                # Normalize image URL
-                if src.startswith("/"):
+                # Filter links: we only want stylesheets and icons
+                if tag == "link":
+                    rel = el.get("rel", [])
+                    if isinstance(rel, str): rel = [rel]
+                    if "stylesheet" in rel:
+                        local_dir = "css"
+                    elif any(r in rel for r in ["icon", "shortcut icon", "apple-touch-icon"]):
+                        local_dir = "images"
+                    else:
+                        continue # Skip other links (canonical, alternate, etc.)
+
+                asset_tasks.append((el, attr, val, local_dir))
+        
+        # 2. Download and update paths
+        if asset_tasks:
+            pbar = tqdm(total=len(asset_tasks), desc="Telegraph Assets", unit="file", leave=False)
+            for i, (el, attr, orig_val, local_dir) in enumerate(asset_tasks):
+                src = orig_val
+                
+                # Normalize URL
+                if src.startswith("//"):
+                    src = "https:" + src
+                elif src.startswith("/"):
                     src = "https://telegra.ph" + src
                 elif src.startswith("tps://"):
-                    src = "ht" + src
+                    src = "https://" + src[6:]
                 elif not src.startswith("http"):
                     src = "https://" + src
 
-                img_name = f"{i}_{os.path.basename(src.split('?')[0])}"
-                img_path = os.path.join(img_folder, img_name)
-                
-                # Skip if image already exists and is not empty
-                if os.path.exists(img_path) and os.path.getsize(img_path) > 0:
+                # Generate local path
+                # Skip external trackers/analytics if possible, but keep it simple for now
+                if "google-analytics.com" in src:
                     pbar.update(1)
                     continue
 
-                try:
-                    async with self.session.get(src) as r:
-                        if r.status == 200:
-                            content = await r.read()
-                            if content:
-                                async with aiofiles.open(img_path, "wb") as f:
-                                    await f.write(content)
-                        else:
-                            print(f"\n  Failed to download telegraph image {src}: HTTP {r.status}")
-                except Exception as e:
-                    print(f"\n  Error downloading telegraph image {src}: {e}")
+                filename = os.path.basename(src.split("?")[0])
+                if not filename or filename.endswith("/"):
+                    filename = f"asset_{i}"
+                
+                # Ensure unique filename to avoid collisions in same local_dir
+                filename = f"{i}_{filename}"
+                
+                local_subdir = os.path.join(folder, local_dir)
+                os.makedirs(local_subdir, exist_ok=True)
+                
+                img_path = os.path.join(local_subdir, filename)
+                local_rel_path = f"{local_dir}/{filename}"
+                
+                # Download if not already present
+                if not (os.path.exists(img_path) and os.path.getsize(img_path) > 0):
+                    try:
+                        async with self.session.get(src) as r:
+                            if r.status == 200:
+                                content = await r.read()
+                                if content:
+                                    async with aiofiles.open(img_path, "wb") as f:
+                                        await f.write(content)
+                            else:
+                                # print(f"\n  Failed to download asset {src}: HTTP {r.status}")
+                                pass
+                    except Exception:
+                        pass
+
+                # Update path in HTML only if file exists
+                if os.path.exists(img_path):
+                    el[attr] = local_rel_path
                 
                 pbar.update(1)
             pbar.close()
+
+        # 3. Save modified HTML
+        async with aiofiles.open(
+            os.path.join(folder, "index.html"), "w", encoding="utf-8"
+        ) as f:
+            await f.write(soup.prettify())
+        
+        return
