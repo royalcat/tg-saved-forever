@@ -84,6 +84,21 @@ HTML_TEMPLATE = """
             text-decoration: none;
             color: #004085;
         }}
+        .album-grid {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 10px;
+        }}
+        .album-item {{
+            flex: 1 1 200px;
+            max-width: 100%;
+        }}
+        .album-item img, .album-item video {{
+            width: 100%;
+            height: auto;
+            border-radius: 5px;
+        }}
     </style>
 </head>
 <body>
@@ -119,12 +134,40 @@ def generate_html(base_path="./downloads", output_file="index.html"):
                     print(f"Error reading {meta_path}: {e}")
 
     # Sort messages by date
-    messages.sort(key=lambda x: x.get("date", ""))
+    messages.sort(key=lambda x: (x.get("date", ""), x.get("id", 0)))
+
+    # Group messages by grouped_id
+    grouped_list = []
+    current_group = []
+    last_grouped_id = None
+
+    for msg in messages:
+        gid = msg.get("grouped_id")
+        if gid is not None:
+            if gid == last_grouped_id:
+                current_group.append(msg)
+            else:
+                if current_group:
+                    grouped_list.append(current_group)
+                current_group = [msg]
+                last_grouped_id = gid
+        else:
+            if current_group:
+                grouped_list.append(current_group)
+                current_group = []
+                last_grouped_id = None
+            grouped_list.append([msg])
+    
+    if current_group:
+        grouped_list.append(current_group)
 
     messages_html = ""
-    for msg in messages:
-        msg_id = msg.get("id")
-        date_str = msg.get("date")
+    for group in grouped_list:
+        # We take primary info from the first message in group
+        main_msg = group[0]
+        msg_id = main_msg.get("id")
+        date_str = main_msg.get("date")
+        
         if date_str:
             try:
                 date_obj = datetime.fromisoformat(date_str)
@@ -134,13 +177,14 @@ def generate_html(base_path="./downloads", output_file="index.html"):
         else:
             display_date = "Unknown date"
 
-        text = msg.get("text", "")
-        if text:
-            text = text.replace("\n", "<br>")
-        else:
-            text = ""
+        # Captions can be in any message of the group, find the first non-empty one
+        text = ""
+        for msg in group:
+            if msg.get("text"):
+                text = msg.get("text").replace("\n", "<br>")
+                break
             
-        forward = msg.get("forward")
+        forward = main_msg.get("forward")
         
         msg_class = "message"
         header_html = ""
@@ -149,81 +193,99 @@ def generate_html(base_path="./downloads", output_file="index.html"):
             from_name = forward.get("from_name") or forward.get("from_id") or "Unknown"
             header_html = f'<div class="message-header">Forwarded from {from_name}</div>'
 
-        # Find media files in the folder
         media_html = ""
-        folder_path = os.path.join(base_path, msg["folder"])
-        for file in os.listdir(folder_path):
-            if file in ["meta.json", "message.txt"] or file.startswith("telegraph_") or file.startswith("linked_") or file.startswith("."):
-                continue
+        is_album = len(group) > 1
+        
+        if is_album:
+            media_html += '<div class="album-grid">'
+        
+        for msg in group:
+            msg_folder = msg["folder"]
+            folder_path = os.path.join(base_path, msg_folder)
             
-            file_rel_path = f"{msg['folder']}/{file}"
-            ext = file.split(".")[-1].lower()
-            
-            if ext in ["jpg", "jpeg", "png", "gif", "webp"]:
-                media_html += f'<div class="media"><img src="{file_rel_path}" alt="Image"></div>'
-            elif ext in ["mp4", "webm", "mov"]:
-                media_html += f'<div class="media"><video controls src="{file_rel_path}"></video></div>'
-            elif ext in ["mp3", "ogg", "wav", "m4a"]:
-                media_html += f'<div class="media"><audio controls src="{file_rel_path}"></audio></div>'
-            else:
-                media_html += f'<div class="media"><a href="{file_rel_path}" class="file-link">Download {file}</a></div>'
+            # Find media files in the folder
+            for file in os.listdir(folder_path):
+                if file in ["meta.json", "message.txt"] or file.startswith("telegraph_") or file.startswith("linked_") or file.startswith("."):
+                    continue
+                
+                file_rel_path = f"{msg_folder}/{file}"
+                ext = file.split(".")[-1].lower()
+                
+                div_class = "album-item" if is_album else "media"
+                
+                if ext in ["jpg", "jpeg", "png", "gif", "webp"]:
+                    media_html += f'<div class="{div_class}"><img src="{file_rel_path}" alt="Image"></div>'
+                elif ext in ["mp4", "webm", "mov"]:
+                    media_html += f'<div class="{div_class}"><video controls src="{file_rel_path}"></video></div>'
+                elif ext in ["mp3", "ogg", "wav", "m4a"]:
+                    media_html += f'<div class="media"><audio controls src="{file_rel_path}"></audio></div>'
+                else:
+                    media_html += f'<div class="media"><a href="{file_rel_path}" class="file-link">Download {file}</a></div>'
 
-        # Check for Telegraph folders
-        for item in os.listdir(folder_path):
-            if item.startswith("telegraph_"):
-                telegraph_path = f"{msg['folder']}/{item}/index.html"
-                media_html += f'<a href="{telegraph_path}" class="telegraph-link">Telegraph Page: {item}</a>'
+            # Check for Telegraph folders
+            for item in os.listdir(folder_path):
+                if item.startswith("telegraph_"):
+                    telegraph_path = f"{msg_folder}/{item}/index.html"
+                    media_html += f'<a href="{telegraph_path}" class="telegraph-link">Telegraph Page: {item}</a>'
 
-        # Check for linked messages
-        linked_html = ""
-        for item in os.listdir(folder_path):
-            if item.startswith("linked_"):
-                linked_meta_path = os.path.join(folder_path, item, "meta.json")
-                if os.path.exists(linked_meta_path):
-                    with open(linked_meta_path, "r", encoding="utf-8") as f:
-                        linked_msg = json.load(f)
-                        linked_text = linked_msg.get("text", "")
-                        if linked_text:
-                            linked_text = linked_text.replace("\n", "<br>")
-                        else:
-                            linked_text = ""
-                            
-                        linked_html += f'<div class="message forwarded" style="margin-top: 10px; font-size: 0.9em;">'
-                        linked_html += f'<div class="message-header">Linked Content</div>'
-                        linked_html += f'<div>{linked_text}</div>'
-                        
-                        # Media in linked folder
-                        linked_folder_full = os.path.join(folder_path, item)
-                        for lf in os.listdir(linked_folder_full):
-                            if lf in ["meta.json", "message.txt"] or lf.startswith("."): continue
-                            lf_rel_path = f"{msg['folder']}/{item}/{lf}"
-                            lext = lf.split(".")[-1].lower()
-                            if lext in ["jpg", "jpeg", "png", "gif", "webp"]:
-                                linked_html += f'<div class="media"><img src="{lf_rel_path}" alt="Image"></div>'
-                            elif lext in ["mp4", "webm", "mov"]:
-                                linked_html += f'<div class="media"><video controls src="{lf_rel_path}"></video></div>'
-                            elif lext in ["mp3", "ogg", "wav", "m4a"]:
-                                linked_html += f'<div class="media"><audio controls src="{lf_rel_path}"></audio></div>'
+            # Check for linked messages
+            for item in os.listdir(folder_path):
+                if item.startswith("linked_"):
+                    linked_meta_path = os.path.join(folder_path, item, "meta.json")
+                    if os.path.exists(linked_meta_path):
+                        with open(linked_meta_path, "r", encoding="utf-8") as f:
+                            linked_msg = json.load(f)
+                            linked_text = linked_msg.get("text", "")
+                            if linked_text:
+                                linked_text = linked_text.replace("\n", "<br>")
                             else:
-                                linked_html += f'<div class="media"><a href="{lf_rel_path}" class="file-link">Download {lf}</a></div>'
-                        linked_html += '</div>'
+                                linked_text = ""
+                                
+                            media_html += f'<div class="message forwarded" style="margin-top: 10px; font-size: 0.9em;">'
+                            media_html += f'<div class="message-header">Linked Content</div>'
+                            media_html += f'<div>{linked_text}</div>'
+                            
+                            # Media in linked folder
+                            linked_folder_full = os.path.join(folder_path, item)
+                            for lf in os.listdir(linked_folder_full):
+                                if lf in ["meta.json", "message.txt"] or lf.startswith("."): continue
+                                lf_rel_path = f"{msg_folder}/{item}/{lf}"
+                                lext = lf.split(".")[-1].lower()
+                                if lext in ["jpg", "jpeg", "png", "gif", "webp"]:
+                                    media_html += f'<div class="media"><img src="{lf_rel_path}" alt="Image"></div>'
+                                elif lext in ["mp4", "webm", "mov"]:
+                                    media_html += f'<div class="media"><video controls src="{lf_rel_path}"></video></div>'
+                                elif lext in ["mp3", "ogg", "wav", "m4a"]:
+                                    media_html += f'<div class="media"><audio controls src="{lf_rel_path}"></audio></div>'
+                                else:
+                                    media_html += f'<div class="media"><a href="{lf_rel_path}" class="file-link">Download {lf}</a></div>'
+                            media_html += '</div>'
+
+        if is_album:
+            media_html += '</div>'
 
         messages_html += f"""
         <div class="{msg_class}" id="msg-{msg_id}">
             {header_html}
             <div class="message-text">{text}</div>
             {media_html}
-            {linked_html}
             <div class="message-date">#{msg_id} - {display_date}</div>
         </div>
         """
 
     full_html = HTML_TEMPLATE.format(messages_html=messages_html)
     
-    with open(os.path.join(base_path, output_file), "w", encoding="utf-8") as f:
-        f.write(full_html)
-    
-    print(f"HTML backup generated at {os.path.join(base_path, output_file)}")
+    final_path = os.path.join(base_path, output_file)
+    tmp_path = final_path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(full_html)
+        os.replace(tmp_path, final_path)
+        print(f"HTML backup generated at {final_path}")
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        print(f"Error generating HTML: {e}")
 
 if __name__ == "__main__":
     generate_html()

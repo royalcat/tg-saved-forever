@@ -3,6 +3,8 @@ import io
 import json
 import os
 import re
+import shutil
+import uuid
 from typing import Optional
 
 import aiofiles
@@ -65,8 +67,15 @@ class MTDownloader:
         return 0
 
     def _save_state(self):
-        with open(self.state_file, "w") as f:
-            json.dump({"last_msg_id": self.last_msg_id}, f)
+        tmp_state_file = self.state_file + ".tmp"
+        try:
+            with open(tmp_state_file, "w") as f:
+                json.dump({"last_msg_id": self.last_msg_id}, f)
+            os.replace(tmp_state_file, self.state_file)
+        except Exception:
+            if os.path.exists(tmp_state_file):
+                os.remove(tmp_state_file)
+            raise
 
     async def start(self, phone: Optional[str] = None):
         print("Attempting to connect to Telegram...")
@@ -98,17 +107,18 @@ class MTDownloader:
 
         pbar = tqdm(total=len(messages), desc="Backing up", unit="msg")
         for message in messages:
-            try:
-                # Update progress bar description with dynamic message info
-                msg_date = message.date.strftime("%Y-%m-%d") if message.date else "Unknown"
-                pbar.set_description(f"Msg {message.id} ({msg_date})")
+            # Update progress bar description with dynamic message info
+            msg_date = message.date.strftime("%Y-%m-%d") if message.date else "Unknown"
+            pbar.set_description(f"Msg {message.id} ({msg_date})")
+            
+            # Process the message. If it fails, the exception will propagate up,
+            # stopping the loop and preventing the state update for this and future messages.
+            await self._process_message(message)
+            
+            if message.id > self.last_msg_id:
+                self.last_msg_id = message.id
+                self._save_state()
                 
-                await self._process_message(message)
-                if message.id > self.last_msg_id:
-                    self.last_msg_id = message.id
-                    self._save_state()
-            except Exception as e:
-                print(f"Error processing message {message.id}: {e}")
             pbar.update(1)
         pbar.close()
 
@@ -242,6 +252,7 @@ class MTDownloader:
             "chat_id": message.chat_id,
             "date": message.date.isoformat() if message.date else None,
             "text": message.text,
+            "grouped_id": message.grouped_id,
             "forward": self._get_forward_info(message),
             "reply_to": message.reply_to_msg_id
             if hasattr(message, "reply_to_msg_id")
@@ -249,13 +260,27 @@ class MTDownloader:
         }
 
         path = os.path.join(folder, "meta.json")
-        async with aiofiles.open(path, "w", encoding="utf-8") as f:
-            await f.write(json.dumps(data, ensure_ascii=False, indent=2))
+        tmp_path = path + ".tmp"
+        try:
+            async with aiofiles.open(tmp_path, "w", encoding="utf-8") as f:
+                await f.write(json.dumps(data, ensure_ascii=False, indent=2))
+            os.replace(tmp_path, path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
 
         if message.text:
             txt_path = os.path.join(folder, "message.txt")
-            async with aiofiles.open(txt_path, "w", encoding="utf-8") as f:
-                await f.write(message.text)
+            tmp_txt_path = txt_path + ".tmp"
+            try:
+                async with aiofiles.open(tmp_txt_path, "w", encoding="utf-8") as f:
+                    await f.write(message.text)
+                os.replace(tmp_txt_path, txt_path)
+            except Exception:
+                if os.path.exists(tmp_txt_path):
+                    os.remove(tmp_txt_path)
+                raise
 
     def _get_forward_info(self, message: Message):
         if message.fwd_from:
@@ -313,17 +338,34 @@ class MTDownloader:
                     pbar.n = current
                     pbar.refresh()
 
-                # download_media returns the path where it was saved
-                path = await self.client.download_media(
-                    media, file=folder, progress_callback=callback
-                )
+                # Create a temporary directory in the same folder for downloading
+                # This ensures Telethon chooses the original filename inside it
+                tmp_dir = os.path.join(folder, f".tmp_{uuid.uuid4().hex[:8]}")
+                os.makedirs(tmp_dir, exist_ok=True)
                 
-                if path and os.path.exists(path):
-                    if os.path.getsize(path) == 0:
-                        os.remove(path)
-                        # We don't print here to avoid too much noise, but the file is cleaned up
-        except Exception as e:
+                try:
+                    # Telethon will use tmp_dir and choose the filename automatically
+                    downloaded_path = await self.client.download_media(
+                        media, file=tmp_dir, progress_callback=callback
+                    )
+                    
+                    if downloaded_path and os.path.exists(downloaded_path):
+                        if os.path.getsize(downloaded_path) > 0:
+                            final_filename = os.path.basename(downloaded_path)
+                            final_path = os.path.join(folder, final_filename)
+                            # Atomically move the file to the final location
+                            os.replace(downloaded_path, final_path)
+                finally:
+                    # Clean up the temporary directory and any partial files
+                    if os.path.exists(tmp_dir):
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
+        except (Exception, asyncio.CancelledError) as e:
+            # We catch CancelledError specifically if we want, but it's often a subclass of BaseException
+            # In most cases Exception is enough, but for CLI we might want to catch more.
+            # Telethon might raise its own errors.
             print(f"Failed to download media for msg {message.id}: {e}")
+            if isinstance(e, asyncio.CancelledError):
+                raise
 
     async def _download_telegraph(self, folder: str, url: str):
         # 0. Skip if already exists
@@ -348,8 +390,16 @@ class MTDownloader:
                             ext = "." + content_type.split("/")[1]
                     
                     filename = f"direct_file{ext}"
-                    async with aiofiles.open(os.path.join(folder, filename), "wb") as f:
-                        await f.write(await response.read())
+                    final_path = os.path.join(folder, filename)
+                    tmp_path = final_path + ".tmp"
+                    try:
+                        async with aiofiles.open(tmp_path, "wb") as f:
+                            await f.write(await response.read())
+                        os.replace(tmp_path, final_path)
+                    except Exception:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                        raise
                     return
 
                 html = await response.text()
@@ -428,35 +478,45 @@ class MTDownloader:
                 local_subdir = os.path.join(folder, local_dir)
                 os.makedirs(local_subdir, exist_ok=True)
                 
-                img_path = os.path.join(local_subdir, filename)
+                final_path = os.path.join(local_subdir, filename)
+                tmp_path = final_path + ".tmp"
                 local_rel_path = f"{local_dir}/{filename}"
                 
                 # Download if not already present
-                if not (os.path.exists(img_path) and os.path.getsize(img_path) > 0):
+                if not (os.path.exists(final_path) and os.path.getsize(final_path) > 0):
                     try:
                         async with self.session.get(src) as r:
                             if r.status == 200:
                                 content = await r.read()
                                 if content:
-                                    async with aiofiles.open(img_path, "wb") as f:
+                                    async with aiofiles.open(tmp_path, "wb") as f:
                                         await f.write(content)
+                                    os.replace(tmp_path, final_path)
                             else:
                                 # print(f"\n  Failed to download asset {src}: HTTP {r.status}")
                                 pass
                     except Exception:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
                         pass
 
-                # Update path in HTML only if file exists
-                if os.path.exists(img_path):
+                # Update path in HTML only if final file exists
+                if os.path.exists(final_path):
                     el[attr] = local_rel_path
                 
                 pbar.update(1)
             pbar.close()
 
-        # 3. Save modified HTML
-        async with aiofiles.open(
-            os.path.join(folder, "index.html"), "w", encoding="utf-8"
-        ) as f:
-            await f.write(soup.prettify())
+        # 3. Save modified HTML atomically
+        final_html_path = os.path.join(folder, "index.html")
+        tmp_html_path = final_html_path + ".tmp"
+        try:
+            async with aiofiles.open(tmp_html_path, "w", encoding="utf-8") as f:
+                await f.write(soup.prettify())
+            os.replace(tmp_html_path, final_html_path)
+        except Exception:
+            if os.path.exists(tmp_html_path):
+                os.remove(tmp_html_path)
+            raise
         
         return
