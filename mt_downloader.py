@@ -95,31 +95,29 @@ class MTDownloader:
 
         print(f"Checking for messages newer than ID: {self.last_msg_id}")
 
-        messages = []
-        async for message in self.client.iter_messages(
+        # Create the iterator
+        it = self.client.iter_messages(
             "me", min_id=self.last_msg_id, limit=limit, reverse=True
-        ):
-            messages.append(message)
+        )
 
-        if not messages:
-            print("No new messages to backup.")
-            return
+        pbar = tqdm(desc="Backing up", unit="msg")
 
-        pbar = tqdm(total=len(messages), desc="Backing up", unit="msg")
-        for message in messages:
+        # Iterate and process immediately to prevent file reference expiration
+        async for message in it:
+            pbar.total = it.total
             # Update progress bar description with dynamic message info
             msg_date = message.date.strftime("%Y-%m-%d") if message.date else "Unknown"
             pbar.set_description(f"Msg {message.id} ({msg_date})")
-            
-            # Process the message. If it fails, the exception will propagate up,
-            # stopping the loop and preventing the state update for this and future messages.
+
+            # Process the message immediately
             await self._process_message(message)
-            
+
             if message.id > self.last_msg_id:
                 self.last_msg_id = message.id
                 self._save_state()
-                
+
             pbar.update(1)
+
         pbar.close()
 
     def _normalize_url(self, url: str) -> str:
@@ -136,7 +134,7 @@ class MTDownloader:
         # 2. Standardize case for hostname and strip trailing slash
         # (Telegra.ph URLs are usually case-insensitive, but we stay safe)
         url = url.rstrip("/")
-        
+
         # 3. Strip redundant tracking parameters if any (basic check)
         if "?" in url:
             base, query = url.split("?", 1)
@@ -307,7 +305,11 @@ class MTDownloader:
         # (excluding meta.json, message.txt, and directories like telegraph_*)
         for f in os.listdir(folder):
             full_path = os.path.join(folder, f)
-            if f in ["meta.json", "message.txt"] or f.startswith(".") or os.path.isdir(full_path):
+            if (
+                f in ["meta.json", "message.txt"]
+                or f.startswith(".")
+                or os.path.isdir(full_path)
+            ):
                 continue
             if os.path.getsize(full_path) > 0:
                 return
@@ -323,13 +325,17 @@ class MTDownloader:
                 if isinstance(media.webpage, WebPage):
                     media = media.webpage.document or media.webpage.photo
                 else:
-                    return # e.g. WebPageEmpty
-            
+                    return  # e.g. WebPageEmpty
+
             if not media:
                 return
 
             with tqdm(
-                total=0, unit="B", unit_scale=True, desc=f"Media {message.id}", leave=False
+                total=0,
+                unit="B",
+                unit_scale=True,
+                desc=f"Media {message.id}",
+                leave=False,
             ) as pbar:
 
                 def callback(current, total):
@@ -342,13 +348,13 @@ class MTDownloader:
                 # This ensures Telethon chooses the original filename inside it
                 tmp_dir = os.path.join(folder, f".tmp_{uuid.uuid4().hex[:8]}")
                 os.makedirs(tmp_dir, exist_ok=True)
-                
+
                 try:
                     # Telethon will use tmp_dir and choose the filename automatically
                     downloaded_path = await self.client.download_media(
                         media, file=tmp_dir, progress_callback=callback
                     )
-                    
+
                     if downloaded_path and os.path.exists(downloaded_path):
                         if os.path.getsize(downloaded_path) > 0:
                             final_filename = os.path.basename(downloaded_path)
@@ -379,16 +385,16 @@ class MTDownloader:
                 if response.status != 200:
                     print(f"Failed to fetch telegraph {url}: HTTP {response.status}")
                     return
-                
+
                 content_type = response.headers.get("Content-Type", "").lower()
-                
+
                 # Handle direct image/file links (e.g., telegra.ph/file/...)
                 if "text/html" not in content_type:
                     ext = os.path.splitext(url.split("?")[0])[1]
                     if not ext:
                         if "image/" in content_type:
                             ext = "." + content_type.split("/")[1]
-                    
+
                     filename = f"direct_file{ext}"
                     final_path = os.path.join(folder, filename)
                     tmp_path = final_path + ".tmp"
@@ -425,33 +431,41 @@ class MTDownloader:
         ]
         if self.download_js:
             asset_targets.append(("script", "src", "js"))
-        
+
         asset_tasks = []
         for tag, attr, local_dir in asset_targets:
             for el in soup.find_all(tag):
                 val = el.get(attr)
                 if not val:
                     continue
-                
+
                 # Filter links: we only want stylesheets and icons
                 if tag == "link":
                     rel = el.get("rel", [])
-                    if isinstance(rel, str): rel = [rel]
+                    if isinstance(rel, str):
+                        rel = [rel]
                     if "stylesheet" in rel:
                         local_dir = "css"
-                    elif any(r in rel for r in ["icon", "shortcut icon", "apple-touch-icon"]):
+                    elif any(
+                        r in rel for r in ["icon", "shortcut icon", "apple-touch-icon"]
+                    ):
                         local_dir = "images"
                     else:
-                        continue # Skip other links (canonical, alternate, etc.)
+                        continue  # Skip other links (canonical, alternate, etc.)
 
                 asset_tasks.append((el, attr, val, local_dir))
-        
+
         # 2. Download and update paths
         if asset_tasks:
-            pbar = tqdm(total=len(asset_tasks), desc="Telegraph Assets", unit="file", leave=False)
+            pbar = tqdm(
+                total=len(asset_tasks),
+                desc="Telegraph Assets",
+                unit="file",
+                leave=False,
+            )
             for i, (el, attr, orig_val, local_dir) in enumerate(asset_tasks):
                 src = orig_val
-                
+
                 # Normalize URL
                 if src.startswith("//"):
                     src = "https:" + src
@@ -471,17 +485,17 @@ class MTDownloader:
                 filename = os.path.basename(src.split("?")[0])
                 if not filename or filename.endswith("/"):
                     filename = f"asset_{i}"
-                
+
                 # Ensure unique filename to avoid collisions in same local_dir
                 filename = f"{i}_{filename}"
-                
+
                 local_subdir = os.path.join(folder, local_dir)
                 os.makedirs(local_subdir, exist_ok=True)
-                
+
                 final_path = os.path.join(local_subdir, filename)
                 tmp_path = final_path + ".tmp"
                 local_rel_path = f"{local_dir}/{filename}"
-                
+
                 # Download if not already present
                 if not (os.path.exists(final_path) and os.path.getsize(final_path) > 0):
                     try:
@@ -503,7 +517,7 @@ class MTDownloader:
                 # Update path in HTML only if final file exists
                 if os.path.exists(final_path):
                     el[attr] = local_rel_path
-                
+
                 pbar.update(1)
             pbar.close()
 
@@ -518,5 +532,5 @@ class MTDownloader:
             if os.path.exists(tmp_html_path):
                 os.remove(tmp_html_path)
             raise
-        
+
         return
