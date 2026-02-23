@@ -1,26 +1,34 @@
+from __future__ import annotations
+
 import asyncio
-import io
 import json
 import os
 import re
 import shutil
 import uuid
-from typing import Optional
+from collections.abc import Sequence
+from datetime import datetime
+from typing import Protocol, cast, runtime_checkable
 
 import aiofiles
 import aiohttp
 from bs4 import BeautifulSoup as bs
+from bs4 import Tag
 from telethon import TelegramClient
 from telethon.tl.types import (
-    Message,
     MessageEntityTextUrl,
     MessageEntityUrl,
-    MessageMediaDocument,
-    MessageMediaPhoto,
+    MessageFwdHeader,
     MessageMediaWebPage,
+    PeerChannel,
+    PeerUser,
+    User,
     WebPage,
 )
 from tqdm.asyncio import tqdm
+
+# Type alias for raw JSON dicts
+type JsonDict = dict[str, object]
 
 mobile_device = {
     "device_model": "Pixel 6",
@@ -31,7 +39,38 @@ mobile_device = {
 }
 
 
+@runtime_checkable
+class TelegramMessage(Protocol):
+    """Protocol describing the Telethon Message interface we use."""
+
+    @property
+    def id(self) -> int: ...
+    @property
+    def text(self) -> str | None: ...
+    @property
+    def date(self) -> datetime | None: ...
+    @property
+    def chat_id(self) -> int: ...
+    @property
+    def media(self) -> object | None: ...
+    @property
+    def entities(self) -> Sequence[object] | None: ...
+    @property
+    def fwd_from(self) -> MessageFwdHeader | None: ...
+    @property
+    def grouped_id(self) -> int | None: ...
+    @property
+    def reply_to_msg_id(self) -> int | None: ...
+
+
 class MTDownloader:
+    client: TelegramClient
+    session: aiohttp.ClientSession
+    base_path: str
+    download_js: bool
+    state_file: str
+    last_msg_id: int
+
     def __init__(
         self,
         session_name: str,
@@ -39,7 +78,7 @@ class MTDownloader:
         api_hash: str,
         base_path: str = "./downloads",
         download_js: bool = False,
-    ):
+    ) -> None:
         self.client = TelegramClient(
             session_name,
             api_id,
@@ -50,7 +89,7 @@ class MTDownloader:
             lang_code=mobile_device["lang_code"],
             system_lang_code=mobile_device["system_lang_code"],
         )
-        self.session = None  # Initialized in start()
+        self.session = aiohttp.ClientSession()
         self.base_path = base_path
         self.download_js = download_js
         self.state_file = os.path.join(self.base_path, ".state.json")
@@ -61,12 +100,17 @@ class MTDownloader:
         if os.path.exists(self.state_file):
             try:
                 with open(self.state_file, "r") as f:
-                    return json.load(f).get("last_msg_id", 0)
+                    raw = cast(object, json.load(f))
+                    if isinstance(raw, dict):
+                        d = cast(JsonDict, raw)
+                        val = d.get("last_msg_id", 0)
+                        if isinstance(val, int):
+                            return val
             except Exception:
                 pass
         return 0
 
-    def _save_state(self):
+    def _save_state(self) -> None:
         tmp_state_file = self.state_file + ".tmp"
         try:
             with open(tmp_state_file, "w") as f:
@@ -77,46 +121,55 @@ class MTDownloader:
                 os.remove(tmp_state_file)
             raise
 
-    async def start(self, phone: Optional[str] = None):
+    async def start(self, phone: str | None = None) -> None:
         print("Attempting to connect to Telegram...")
-        await self.client.start(phone=phone)
-        if not self.session:
-            self.session = aiohttp.ClientSession()
+        if phone is not None:
+            await self.client.start(phone=phone)  # pyright: ignore[reportGeneralTypeIssues]
+        else:
+            await self.client.start()  # pyright: ignore[reportGeneralTypeIssues]
 
-    async def close(self):
-        await self.client.disconnect()
+    async def close(self) -> None:
+        self.client.disconnect()  # pyright: ignore[reportUnusedCallResult]
         if self.session:
             await self.session.close()
 
-    async def backup_saved_messages(self, limit: Optional[int] = None):
+    async def backup_saved_messages(self, limit: int | None = None) -> None:
         """Backups messages from 'Saved Messages'."""
         me = await self.client.get_me()
-        print(f"Connected as {me.username or me.first_name}")
+        if isinstance(me, User):
+            display_name: str = me.username or me.first_name or "Unknown"
+            print(f"Connected as {display_name}")
+        else:
+            print("Connected.")
 
         print(f"Checking for messages newer than ID: {self.last_msg_id}")
 
-        # Create the iterator
-        it = self.client.iter_messages(
-            "me", min_id=self.last_msg_id, limit=limit, reverse=True
-        )
+        # Create the iterator with explicit kwargs
+        if limit is not None:
+            it = self.client.iter_messages(
+                "me", min_id=self.last_msg_id, limit=limit, reverse=True
+            )
+        else:
+            it = self.client.iter_messages("me", min_id=self.last_msg_id, reverse=True)
 
-        pbar = tqdm(desc="Backing up", unit="msg")
+        pbar = tqdm(desc="Backing up", unit="msg", dynamic_ncols=True)
 
         # Iterate and process immediately to prevent file reference expiration
-        async for message in it:
+        async for message in it:  # pyright: ignore[reportUnknownVariableType]
             pbar.total = it.total
             # Update progress bar description with dynamic message info
-            msg_date = message.date.strftime("%Y-%m-%d") if message.date else "Unknown"
-            pbar.set_description(f"Msg {message.id} ({msg_date})")
+            msg = cast(TelegramMessage, message)
+            msg_date_str: str = msg.date.strftime("%Y-%m-%d") if msg.date else "Unknown"
+            pbar.set_description(f"Msg {msg.id} ({msg_date_str})")
 
             # Process the message immediately
-            await self._process_message(message)
+            await self._process_message(msg)
 
-            if message.id > self.last_msg_id:
-                self.last_msg_id = message.id
+            if msg.id > self.last_msg_id:
+                self.last_msg_id = msg.id
                 self._save_state()
 
-            pbar.update(1)
+            _ = pbar.update(1)
 
         pbar.close()
 
@@ -132,18 +185,16 @@ class MTDownloader:
             url = "https://" + url
 
         # 2. Standardize case for hostname and strip trailing slash
-        # (Telegra.ph URLs are usually case-insensitive, but we stay safe)
         url = url.rstrip("/")
 
         # 3. Strip redundant tracking parameters if any (basic check)
         if "?" in url:
-            base, query = url.split("?", 1)
-            # You could filter query params here if needed
+            base, _query = url.split("?", 1)
             url = base
 
         return url
 
-    async def _process_message(self, message: Message, depth: int = 0):
+    async def _process_message(self, message: TelegramMessage, depth: int = 0) -> None:
         if depth > 2:  # Prevent deep recursion
             return
 
@@ -161,15 +212,17 @@ class MTDownloader:
             await self._save_media(message, msg_folder)
 
         # 3. Check for Telegraph links
-        telegraph_urls = set()
+        telegraph_urls: set[str] = set()
         if message.entities:
             for entity in message.entities:
-                url = None
+                url: str | None = None
                 if isinstance(entity, MessageEntityTextUrl):
                     url = entity.url
                 elif isinstance(entity, MessageEntityUrl):
                     # For plain URLs, we need to extract from text
-                    url = message.text[entity.offset : entity.offset + entity.length]
+                    msg_text = message.text
+                    if msg_text is not None:
+                        url = msg_text[entity.offset : entity.offset + entity.length]
 
                 if url and "telegra.ph" in url:
                     telegraph_urls.add(self._normalize_url(url))
@@ -178,7 +231,7 @@ class MTDownloader:
         if isinstance(message.media, MessageMediaWebPage) and isinstance(
             message.media.webpage, WebPage
         ):
-            wp_url = message.media.webpage.url
+            wp_url: str | None = message.media.webpage.url
             if wp_url and "telegra.ph" in wp_url:
                 telegraph_urls.add(self._normalize_url(wp_url))
 
@@ -190,21 +243,22 @@ class MTDownloader:
         # 4. Process Message Links (t.me/...)
         await self._process_links(message, depth)
 
-    async def _process_links(self, message: Message, depth: int):
-        if not message.text:
+    async def _process_links(self, message: TelegramMessage, depth: int) -> None:
+        msg_text = message.text
+        if not msg_text:
             return
 
         # Improved regex for telegram message links
         link_pattern = re.compile(
             r"(?:https?://)?t\.me/(?:c/(\d+)|([a-zA-Z0-9_]+))/(\d+)"
         )
-        matches = link_pattern.findall(message.text)
+        matches: list[tuple[str, ...]] = link_pattern.findall(msg_text)
 
         for match in matches:
             channel_id_str, username, msg_id_str = match
             msg_id = int(msg_id_str)
 
-            peer = None
+            peer: str | int | None = None
             if channel_id_str:
                 try:
                     # Private channels in Telethon need to be prefixed with -100 if only digits
@@ -215,21 +269,23 @@ class MTDownloader:
                 peer = username
 
             try:
-                fetched_msgs = await self.client.get_messages(peer, ids=[msg_id])
-                if fetched_msgs and fetched_msgs[0]:
-                    # We process linked messages within the SAME folder or a subfolder?
-                    # Let's put linked content in a subfolder of the original message
+                fetched = await self.client.get_messages(peer, ids=[msg_id])  # pyright: ignore[reportUnknownMemberType]
+                fetched_list: list[object] = (
+                    list(fetched) if isinstance(fetched, list) else [fetched]
+                )
+                if fetched_list and fetched_list[0]:
+                    fetched_msg = cast(TelegramMessage, fetched_list[0])
                     parent_folder = os.path.join(self.base_path, str(message.id))
                     await self._process_linked_message(
-                        fetched_msgs[0], parent_folder, depth + 1
+                        fetched_msg, parent_folder, depth + 1
                     )
-            except Exception as e:
-                # print(f"Failed to fetch linked message {peer}/{msg_id}: {e}")
+            except Exception:
+                # Failed to fetch linked message
                 pass
 
     async def _process_linked_message(
-        self, message: Message, parent_folder: str, depth: int
-    ):
+        self, message: TelegramMessage, parent_folder: str, depth: int
+    ) -> None:
         linked_folder = os.path.join(
             parent_folder, f"linked_{message.chat_id}_{message.id}"
         )
@@ -241,56 +297,55 @@ class MTDownloader:
 
         # We could recurse further but limit it
         if depth < 2:
-            # Look for links in THIS linked message too? Maybe not needed for now to avoid bloat
             pass
 
-    async def _save_text(self, message: Message, folder: str):
-        data = {
+    async def _save_text(self, message: TelegramMessage, folder: str) -> None:
+        data: dict[str, object] = {
             "id": message.id,
             "chat_id": message.chat_id,
             "date": message.date.isoformat() if message.date else None,
             "text": message.text,
             "grouped_id": message.grouped_id,
             "forward": self._get_forward_info(message),
-            "reply_to": message.reply_to_msg_id
-            if hasattr(message, "reply_to_msg_id")
-            else None,
+            "reply_to": message.reply_to_msg_id,
         }
 
         path = os.path.join(folder, "meta.json")
         tmp_path = path + ".tmp"
         try:
             async with aiofiles.open(tmp_path, "w", encoding="utf-8") as f:
-                await f.write(json.dumps(data, ensure_ascii=False, indent=2))
+                _ = await f.write(json.dumps(data, ensure_ascii=False, indent=2))
             os.replace(tmp_path, path)
         except Exception:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
             raise
 
-        if message.text:
+        msg_text = message.text
+        if msg_text:
             txt_path = os.path.join(folder, "message.txt")
             tmp_txt_path = txt_path + ".tmp"
             try:
                 async with aiofiles.open(tmp_txt_path, "w", encoding="utf-8") as f:
-                    await f.write(message.text)
+                    _ = await f.write(msg_text)
                 os.replace(tmp_txt_path, txt_path)
             except Exception:
                 if os.path.exists(tmp_txt_path):
                     os.remove(tmp_txt_path)
                 raise
 
-    def _get_forward_info(self, message: Message):
-        if message.fwd_from:
-            fwd = message.fwd_from
-            from_id = None
-            if fwd.from_id:
-                if hasattr(fwd.from_id, "user_id"):
-                    from_id = fwd.from_id.user_id
-                elif hasattr(fwd.from_id, "channel_id"):
-                    from_id = fwd.from_id.channel_id
-                elif hasattr(fwd.from_id, "chat_id"):
-                    from_id = fwd.from_id.chat_id
+    def _get_forward_info(self, message: TelegramMessage) -> dict[str, object] | None:
+        fwd = message.fwd_from
+        if fwd is not None:
+            from_id: int | None = None
+            peer = fwd.from_id
+            if peer is not None:
+                if isinstance(peer, PeerUser):
+                    from_id = peer.user_id
+                elif isinstance(peer, PeerChannel):
+                    from_id = peer.channel_id
+                else:
+                    from_id = peer.chat_id
 
             return {
                 "date": fwd.date.isoformat() if fwd.date else None,
@@ -300,14 +355,13 @@ class MTDownloader:
             }
         return None
 
-    async def _save_media(self, message: Message, folder: str):
+    async def _save_media(self, message: TelegramMessage, folder: str) -> None:
         # 1. Skip if we already have a valid non-zero file in this folder
-        # (excluding meta.json, message.txt, and directories like telegraph_*)
-        for f in os.listdir(folder):
-            full_path = os.path.join(folder, f)
+        for f_name in os.listdir(folder):
+            full_path = os.path.join(folder, f_name)
             if (
-                f in ["meta.json", "message.txt"]
-                or f.startswith(".")
+                f_name in ("meta.json", "message.txt")
+                or f_name.startswith(".")
                 or os.path.isdir(full_path)
             ):
                 continue
@@ -338,46 +392,46 @@ class MTDownloader:
                 leave=False,
             ) as pbar:
 
-                def callback(current, total):
+                def callback(current: int, total: int) -> None:
                     if total:
                         pbar.total = total
                     pbar.n = current
                     pbar.refresh()
 
                 # Create a temporary directory in the same folder for downloading
-                # This ensures Telethon chooses the original filename inside it
                 tmp_dir = os.path.join(folder, f".tmp_{uuid.uuid4().hex[:8]}")
                 os.makedirs(tmp_dir, exist_ok=True)
 
                 try:
                     # Telethon will use tmp_dir and choose the filename automatically
                     downloaded_path = await self.client.download_media(
-                        media, file=tmp_dir, progress_callback=callback
+                        media,  # pyright: ignore[reportArgumentType]
+                        file=tmp_dir,
+                        progress_callback=callback,
                     )
 
-                    if downloaded_path and os.path.exists(downloaded_path):
+                    if (
+                        downloaded_path
+                        and isinstance(downloaded_path, str)
+                        and os.path.exists(downloaded_path)
+                    ):
                         if os.path.getsize(downloaded_path) > 0:
                             final_filename = os.path.basename(downloaded_path)
                             final_path = os.path.join(folder, final_filename)
-                            # Atomically move the file to the final location
                             os.replace(downloaded_path, final_path)
                 finally:
-                    # Clean up the temporary directory and any partial files
                     if os.path.exists(tmp_dir):
                         shutil.rmtree(tmp_dir, ignore_errors=True)
         except (Exception, asyncio.CancelledError) as e:
-            # We catch CancelledError specifically if we want, but it's often a subclass of BaseException
-            # In most cases Exception is enough, but for CLI we might want to catch more.
-            # Telethon might raise its own errors.
             print(f"Failed to download media for msg {message.id}: {e}")
             if isinstance(e, asyncio.CancelledError):
                 raise
 
-    async def _download_telegraph(self, folder: str, url: str):
+    async def _download_telegraph(self, folder: str, url: str) -> None:
         # 0. Skip if already exists
-        if os.path.exists(os.path.join(folder, "index.html")):
-            if os.path.getsize(os.path.join(folder, "index.html")) > 0:
-                return
+        index_path = os.path.join(folder, "index.html")
+        if os.path.exists(index_path) and os.path.getsize(index_path) > 0:
+            return
 
         os.makedirs(folder, exist_ok=True)
         try:
@@ -400,7 +454,7 @@ class MTDownloader:
                     tmp_path = final_path + ".tmp"
                     try:
                         async with aiofiles.open(tmp_path, "wb") as f:
-                            await f.write(await response.read())
+                            _ = await f.write(await response.read())
                         os.replace(tmp_path, final_path)
                     except Exception:
                         if os.path.exists(tmp_path):
@@ -421,7 +475,7 @@ class MTDownloader:
                 script.decompose()
 
         # 2. Collect all assets to download (tag, attribute, local_dir)
-        asset_targets = [
+        asset_targets: list[tuple[str, str, str]] = [
             ("img", "src", "images"),
             ("video", "src", "images"),
             ("video", "poster", "images"),
@@ -432,36 +486,47 @@ class MTDownloader:
         if self.download_js:
             asset_targets.append(("script", "src", "js"))
 
-        asset_tasks = []
-        for tag, attr, local_dir in asset_targets:
-            for el in soup.find_all(tag):
+        asset_tasks: list[tuple[Tag, str, str, str]] = []
+        for tag_name, attr, local_dir in asset_targets:
+            for el in soup.find_all(tag_name):
                 val = el.get(attr)
-                if not val:
+                if not val or not isinstance(val, str):
                     continue
 
+                target_dir = local_dir
+
                 # Filter links: we only want stylesheets and icons
-                if tag == "link":
-                    rel = el.get("rel", [])
-                    if isinstance(rel, str):
-                        rel = [rel]
-                    if "stylesheet" in rel:
-                        local_dir = "css"
+                if tag_name == "link":
+                    rel = el.get("rel")
+                    if rel is None:
+                        continue
+                    # BS4 returns rel as a list of strings
+                    rel_list: list[str]
+                    if isinstance(rel, list):
+                        rel_list = [str(r) for r in rel]
+                    else:
+                        rel_list = [str(rel)]
+
+                    if "stylesheet" in rel_list:
+                        target_dir = "css"
                     elif any(
-                        r in rel for r in ["icon", "shortcut icon", "apple-touch-icon"]
+                        r in rel_list
+                        for r in ("icon", "shortcut icon", "apple-touch-icon")
                     ):
-                        local_dir = "images"
+                        target_dir = "images"
                     else:
                         continue  # Skip other links (canonical, alternate, etc.)
 
-                asset_tasks.append((el, attr, val, local_dir))
+                asset_tasks.append((el, attr, val, target_dir))
 
         # 2. Download and update paths
         if asset_tasks:
-            pbar = tqdm(
+            asset_pbar = tqdm(
                 total=len(asset_tasks),
                 desc="Telegraph Assets",
                 unit="file",
                 leave=False,
+                dynamic_ncols=True,
             )
             for i, (el, attr, orig_val, local_dir) in enumerate(asset_tasks):
                 src = orig_val
@@ -476,10 +541,9 @@ class MTDownloader:
                 elif not src.startswith("http"):
                     src = "https://" + src
 
-                # Generate local path
-                # Skip external trackers/analytics if possible, but keep it simple for now
+                # Skip external trackers/analytics
                 if "google-analytics.com" in src:
-                    pbar.update(1)
+                    _ = asset_pbar.update(1)
                     continue
 
                 filename = os.path.basename(src.split("?")[0])
@@ -504,33 +568,27 @@ class MTDownloader:
                                 content = await r.read()
                                 if content:
                                     async with aiofiles.open(tmp_path, "wb") as f:
-                                        await f.write(content)
+                                        _ = await f.write(content)
                                     os.replace(tmp_path, final_path)
-                            else:
-                                # print(f"\n  Failed to download asset {src}: HTTP {r.status}")
-                                pass
                     except Exception:
                         if os.path.exists(tmp_path):
                             os.remove(tmp_path)
-                        pass
 
                 # Update path in HTML only if final file exists
                 if os.path.exists(final_path):
                     el[attr] = local_rel_path
 
-                pbar.update(1)
-            pbar.close()
+                _ = asset_pbar.update(1)
+            asset_pbar.close()
 
         # 3. Save modified HTML atomically
         final_html_path = os.path.join(folder, "index.html")
         tmp_html_path = final_html_path + ".tmp"
         try:
             async with aiofiles.open(tmp_html_path, "w", encoding="utf-8") as f:
-                await f.write(soup.prettify())
+                _ = await f.write(soup.prettify())
             os.replace(tmp_html_path, final_html_path)
         except Exception:
             if os.path.exists(tmp_html_path):
                 os.remove(tmp_html_path)
             raise
-
-        return

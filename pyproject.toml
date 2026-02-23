@@ -1,0 +1,34 @@
+[project]
+name = "tg-saved-forever"
+version = "0.1.0"
+description = "Backup your Telegram Saved Messages to local storage with media, Telegraph pages, and offline HTML browsing"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "telethon~=1.42.0",
+    "aiohttp~=3.13.0",
+    "aiofiles~=25.1.0",
+    "beautifulsoup4~=4.14.0",
+    "requests~=2.32.0",
+    "tqdm~=4.67.0",
+    "cryptg~=0.5.0",
+]
+
+[project.optional-dependencies]
+types = [
+    "types-requests~=2.32.0",
+    "lxml-stubs~=0.5.0",
+    "types-PySocks~=1.7.0",
+    "types-aiofiles~=25.1.0",
+    "types-setuptools~=82.0.0",
+]
+
+[project.scripts]
+tg-saved-forever = "main:main"
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["main", "mt_downloader", "html_generator", "utils"]

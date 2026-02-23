@@ -15,7 +15,11 @@ This tool allows you to backup your Telegram "Saved Messages" chat to your local
 1.  Clone the repository or download the files.
 2.  Install dependencies:
     ```bash
-    pip install -r requirements.txt
+    pip install .
+    ```
+    To also install type stubs for development:
+    ```bash
+    pip install ".[types]"
     ```
 
 ## Usage

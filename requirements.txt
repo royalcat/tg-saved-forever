@@ -1,5 +1,0 @@
-telethon
-aiohttp
-aiofiles
-beautifulsoup4
-tqdm

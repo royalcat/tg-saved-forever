@@ -3,3 +3,9 @@ __pycache__
 downloads
 *.session
 *.session-journal
+.mypy_cache
+poetry.lock
+uv.lock
+*.egg-info
+build
+dist
