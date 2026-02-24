@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import asyncio
 import json
 import os
@@ -77,7 +75,7 @@ class MTDownloader:
         api_id: int,
         api_hash: str,
         base_path: str = "./downloads",
-        download_js: bool = False,
+        telegraph_download_js: bool = False,
     ) -> None:
         self.client = TelegramClient(
             session_name,
@@ -91,7 +89,7 @@ class MTDownloader:
         )
         self.session = aiohttp.ClientSession()
         self.base_path = base_path
-        self.download_js = download_js
+        self.download_js = telegraph_download_js
         self.state_file = os.path.join(self.base_path, ".state.json")
         os.makedirs(self.base_path, exist_ok=True)
         self.last_msg_id = self._load_state()
@@ -156,8 +154,8 @@ class MTDownloader:
 
         # Iterate and process immediately to prevent file reference expiration
         async for message in it:  # pyright: ignore[reportUnknownVariableType]
-            pbar.total = it.total
             # Update progress bar description with dynamic message info
+            pbar.total = it.total
             msg = cast(TelegramMessage, message)
             msg_date_str: str = msg.date.strftime("%Y-%m-%d") if msg.date else "Unknown"
             pbar.set_description(f"Msg {msg.id} ({msg_date_str})")

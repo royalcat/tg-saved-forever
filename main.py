@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import argparse
 import asyncio
 import os
@@ -124,7 +122,7 @@ async def main() -> None:
         api_id=config.api_id,
         api_hash=config.api_hash,
         base_path=config.download_path,
-        download_js=config.telegraph_download_js,
+        telegraph_download_js=config.telegraph_download_js,
     )
 
     if config.reset_state:
