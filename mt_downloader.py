@@ -1,8 +1,10 @@
 import asyncio
+import hashlib
 import json
 import os
 import re
 import shutil
+import sys
 import uuid
 from collections.abc import Sequence
 from datetime import datetime
@@ -14,12 +16,16 @@ from bs4 import BeautifulSoup as bs
 from bs4 import Tag
 from telethon import TelegramClient
 from telethon.tl.types import (
+    Document,
     MessageEntityTextUrl,
     MessageEntityUrl,
     MessageFwdHeader,
+    MessageMediaDocument,
+    MessageMediaPhoto,
     MessageMediaWebPage,
     PeerChannel,
     PeerUser,
+    Photo,
     User,
     WebPage,
 )
@@ -27,6 +33,49 @@ from tqdm.asyncio import tqdm
 
 # Type alias for raw JSON dicts
 type JsonDict = dict[str, object]
+
+# Linux ioctl constant for CoW reflink clone
+_FICLONE = 0x40049409
+
+
+def _reflink_copy(src: str, dst: str) -> None:
+    """Copy a file using CoW reflink if possible, falling back to regular copy."""
+    if sys.platform == "linux":
+        try:
+            import fcntl
+
+            with open(src, "rb") as s_fd, open(dst, "wb") as d_fd:
+                _ = fcntl.ioctl(d_fd.fileno(), _FICLONE, s_fd.fileno())
+            return
+        except (OSError, IOError, ImportError):
+            # Filesystem doesn't support reflinks or fcntl unavailable,
+            # fall back to regular copy
+            pass
+    _ = shutil.copy2(src, dst)
+
+
+def _extract_media_key(media: object) -> tuple[str, str | None]:
+    """Extract a dedup key and original filename hint from a Telegram media object.
+
+    Returns (key, filename_hint) where key is like "doc:<id>:<access_hash>"
+    or ("", None) if not extractable.
+    """
+    doc_or_photo: object = None
+    if isinstance(media, MessageMediaDocument) and media.document:
+        doc_or_photo = media.document
+    elif isinstance(media, MessageMediaPhoto) and media.photo:
+        doc_or_photo = media.photo
+    elif isinstance(media, MessageMediaWebPage) and media.webpage:
+        if isinstance(media.webpage, WebPage):
+            doc_or_photo = media.webpage.document or media.webpage.photo
+
+    if isinstance(doc_or_photo, Document):
+        return (f"doc:{doc_or_photo.id}:{doc_or_photo.access_hash}", None)
+    elif isinstance(doc_or_photo, Photo):
+        return (f"photo:{doc_or_photo.id}:{doc_or_photo.access_hash}", None)
+
+    return ("", None)
+
 
 mobile_device = {
     "device_model": "Pixel 6",
@@ -68,6 +117,10 @@ class MTDownloader:
     download_js: bool
     state_file: str
     last_msg_id: int
+    _media_index: dict[str, str]  # media_key -> relative file path
+    _session_fingerprint: str
+    _media_index_file: str
+    _media_index_dirty: bool
 
     def __init__(
         self,
@@ -91,8 +144,13 @@ class MTDownloader:
         self.base_path = base_path
         self.download_js = telegraph_download_js
         self.state_file = os.path.join(self.base_path, ".state.json")
+        self._media_index_file = os.path.join(self.base_path, ".media_hashes.json")
+        self._media_index = {}
+        self._session_fingerprint = ""
+        self._media_index_dirty = False
         os.makedirs(self.base_path, exist_ok=True)
         self.last_msg_id = self._load_state()
+        self._load_media_index()
 
     def _load_state(self) -> int:
         if os.path.exists(self.state_file):
@@ -119,14 +177,86 @@ class MTDownloader:
                 os.remove(tmp_state_file)
             raise
 
+    def _load_media_index(self) -> None:
+        """Load the media hash index from disk."""
+        if os.path.exists(self._media_index_file):
+            try:
+                with open(self._media_index_file, "r") as f:
+                    raw = cast(object, json.load(f))
+                    if isinstance(raw, dict):
+                        d = cast("dict[str, object]", raw)
+                        fp = d.get("session_fingerprint", "")
+                        if isinstance(fp, str):
+                            self._session_fingerprint = fp
+                        media = d.get("media", {})
+                        if isinstance(media, dict):
+                            self._media_index = cast("dict[str, str]", media)
+            except Exception:
+                self._media_index = {}
+                self._session_fingerprint = ""
+
+    def _save_media_index(self) -> None:
+        """Persist the media hash index to disk."""
+        if not self._media_index_dirty:
+            return
+        tmp = self._media_index_file + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(
+                    {
+                        "session_fingerprint": self._session_fingerprint,
+                        "media": self._media_index,
+                    },
+                    f,
+                )
+            os.replace(tmp, self._media_index_file)
+            self._media_index_dirty = False
+        except Exception:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            raise
+
+    def _get_session_fingerprint(self) -> str:
+        """Compute a fingerprint for the current Telegram session auth key."""
+        auth_key = self.client.session.auth_key  # pyright: ignore[reportAttributeAccessIssue]
+        if auth_key and auth_key.key:  # pyright: ignore[reportUnknownMemberType]
+            return hashlib.sha256(auth_key.key).hexdigest()  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+        return ""
+
+    def _check_session_fingerprint(self) -> None:
+        """Verify session fingerprint and invalidate media index if session changed."""
+        current_fp = self._get_session_fingerprint()
+        if not current_fp:
+            return
+
+        if self._session_fingerprint and self._session_fingerprint != current_fp:
+            n = len(self._media_index)
+            print(
+                f"Session changed (auth key differs). Invalidating media dedup index ({n} entries)."
+            )
+            self._media_index.clear()
+            self._media_index_dirty = True
+
+        if self._session_fingerprint != current_fp:
+            self._session_fingerprint = current_fp
+            self._media_index_dirty = True
+
+    def _record_media(self, media_key: str, rel_path: str) -> None:
+        """Record a media key -> file path mapping in the index."""
+        if media_key:
+            self._media_index[media_key] = rel_path
+            self._media_index_dirty = True
+
     async def start(self, phone: str | None = None) -> None:
         print("Attempting to connect to Telegram...")
         if phone is not None:
             await self.client.start(phone=phone)  # pyright: ignore[reportGeneralTypeIssues]
         else:
             await self.client.start()  # pyright: ignore[reportGeneralTypeIssues]
+        self._check_session_fingerprint()
 
     async def close(self) -> None:
+        self._save_media_index()
         self.client.disconnect()  # pyright: ignore[reportUnusedCallResult]
         if self.session:
             await self.session.close()
@@ -166,10 +296,13 @@ class MTDownloader:
             if msg.id > self.last_msg_id:
                 self.last_msg_id = msg.id
                 self._save_state()
+                self._save_media_index()
 
             _ = pbar.update(1)
 
         pbar.close()
+        # Persist media index periodically at end of backup
+        self._save_media_index()
 
     def _normalize_url(self, url: str) -> str:
         if not url:
@@ -353,33 +486,69 @@ class MTDownloader:
             }
         return None
 
-    async def _save_media(self, message: TelegramMessage, folder: str) -> None:
-        # 1. Skip if we already have a valid non-zero file in this folder
-        for f_name in os.listdir(folder):
-            full_path = os.path.join(folder, f_name)
-            if (
-                f_name in ("meta.json", "message.txt")
-                or f_name.startswith(".")
-                or os.path.isdir(full_path)
-            ):
-                continue
-            if os.path.getsize(full_path) > 0:
-                return
-
+    def _find_existing_media_file(self, folder: str) -> str | None:
+        """Return the path of an existing non-meta media file in folder, or None."""
         try:
-            # We want to download the main media or the webpage preview content
-            media = message.media
-            if not media:
-                return
+            for f_name in os.listdir(folder):
+                full_path = os.path.join(folder, f_name)
+                if (
+                    f_name in ("meta.json", "message.txt")
+                    or f_name.startswith(".")
+                    or os.path.isdir(full_path)
+                ):
+                    continue
+                if os.path.getsize(full_path) > 0:
+                    return full_path
+        except FileNotFoundError:
+            pass
+        return None
 
+    async def _save_media(self, message: TelegramMessage, folder: str) -> None:
+        media = message.media
+        if not media:
+            return
+
+        media_key, _ = _extract_media_key(media)
+
+        # 1. If we already have a file in this folder, just record its hash and return
+        existing = self._find_existing_media_file(folder)
+        if existing is not None:
+            if media_key:
+                rel = os.path.relpath(existing, self.base_path)
+                self._record_media(media_key, rel)
+            return
+
+        # 2. Check dedup index: if we already downloaded this exact media, copy it
+        if media_key and media_key in self._media_index:
+            source_rel = self._media_index[media_key]
+            source_abs = os.path.join(self.base_path, source_rel)
+            if os.path.exists(source_abs) and os.path.getsize(source_abs) > 0:
+                dest_filename = os.path.basename(source_abs)
+                dest_path = os.path.join(folder, dest_filename)
+                try:
+                    _reflink_copy(source_abs, dest_path)
+                    print(f"  ↳ Dedup copy for msg {message.id} (reflink if supported)")
+                    return
+                except Exception:
+                    # Copy failed, fall through to download
+                    if os.path.exists(dest_path):
+                        os.remove(dest_path)
+            else:
+                # Source file gone, remove stale index entry
+                del self._media_index[media_key]
+                self._media_index_dirty = True
+
+        # 3. Download the media
+        try:
             # For WebPage media, download its document or photo
+            download_target = media
             if isinstance(media, MessageMediaWebPage) and media.webpage:
                 if isinstance(media.webpage, WebPage):
-                    media = media.webpage.document or media.webpage.photo
+                    download_target = media.webpage.document or media.webpage.photo
                 else:
                     return  # e.g. WebPageEmpty
 
-            if not media:
+            if not download_target:
                 return
 
             with tqdm(
@@ -403,7 +572,7 @@ class MTDownloader:
                 try:
                     # Telethon will use tmp_dir and choose the filename automatically
                     downloaded_path = await self.client.download_media(
-                        media,  # pyright: ignore[reportArgumentType]
+                        download_target,  # pyright: ignore[reportArgumentType]
                         file=tmp_dir,
                         progress_callback=callback,
                     )
@@ -417,6 +586,10 @@ class MTDownloader:
                             final_filename = os.path.basename(downloaded_path)
                             final_path = os.path.join(folder, final_filename)
                             os.replace(downloaded_path, final_path)
+                            # Record in dedup index
+                            if media_key:
+                                rel = os.path.relpath(final_path, self.base_path)
+                                self._record_media(media_key, rel)
                 finally:
                     if os.path.exists(tmp_dir):
                         shutil.rmtree(tmp_dir, ignore_errors=True)
